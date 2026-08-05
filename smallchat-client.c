@@ -124,8 +124,9 @@ int main(int argc, char **argv) {
             } else if (FD_ISSET(stdin_fd, &readfds)) {
                 /* 用户输入: 交给 linenoise 编辑 */
                 if (!editing) {
-                    if (linenoiseEditStart(&l, stdin_fd, fileno(stdout),
-                                           linebuf, sizeof(linebuf), prompt) == -1) {
+                    int r = linenoiseEditStart(&l, stdin_fd, fileno(stdout),
+                                           linebuf, sizeof(linebuf), prompt);
+                    if (r == -1) {
                         perror("linenoiseEditStart");
                         exit(1);
                     }
