@@ -81,6 +81,11 @@ int main(int argc, char **argv) {
     char linebuf[512];
     int editing = 0;  /* 当前是否在编辑输入行 */
     int stdin_fd = fileno(stdin);
+    FILE *dbgf = NULL;
+    if (getenv("CHAT_DEBUG")) {
+        dbgf = fopen("/tmp/chatdbg.log", "w");
+        if (dbgf) setvbuf(dbgf, NULL, _IONBF, 0);
+    }
 
     while (1) {
         fd_set readfds;
@@ -90,6 +95,12 @@ int main(int argc, char **argv) {
         int maxfd = s > stdin_fd ? s : stdin_fd;
 
         int num_events = select(maxfd + 1, &readfds, NULL, NULL, NULL);
+        if (dbgf)
+            fprintf(dbgf, "sel=%d s=%d in=%d edit=%d\n",
+                    num_events,
+                    FD_ISSET(s, &readfds) ? 1 : 0,
+                    FD_ISSET(stdin_fd, &readfds) ? 1 : 0,
+                    editing);
         if (num_events == -1) {
             perror("select() error");
             exit(1);
@@ -99,6 +110,7 @@ int main(int argc, char **argv) {
             if (FD_ISSET(s, &readfds)) {
                 /* Data from the server? */
                 ssize_t count = read(s, buf, sizeof(buf));
+                if (dbgf) fprintf(dbgf, "  sock_read=%zd\n", count);
                 if (count <= 0) {
                     printf("Connection lost\n");
                     exit(1);
@@ -126,6 +138,7 @@ int main(int argc, char **argv) {
                 if (!editing) {
                     int r = linenoiseEditStart(&l, stdin_fd, fileno(stdout),
                                            linebuf, sizeof(linebuf), prompt);
+                    if (dbgf) fprintf(dbgf, "  EditStart=%d\n", r);
                     if (r == -1) {
                         perror("linenoiseEditStart");
                         exit(1);
@@ -133,6 +146,16 @@ int main(int argc, char **argv) {
                     editing = 1;
                 }
                 char *res = linenoiseEditFeed(&l);
+                if (dbgf)
+                    fprintf(dbgf, "  feed=%s errno=%d\n",
+                            res == NULL ? "NULL" :
+                            res == linenoiseEditMore ? "MORE" : "LINE",
+                            errno);
+                if (res == NULL && errno == EINTR) {
+                    /* 被信号(如 SIGWINCH)打断的读: 不是真退出, 继续编辑 */
+                    if (dbgf) fprintf(dbgf, "  EINTR -> continue\n");
+                    continue;
+                }
                 if (res == NULL) {
                     /* Ctrl+C / Ctrl+D: 退出 */
                     printf("\nBye.\n");
