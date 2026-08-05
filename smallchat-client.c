@@ -34,9 +34,24 @@
 #include <stdlib.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 
 #include "chatlib.h"
 #include "linenoise.h"
+
+/* 若终端窗口尺寸为 0 (部分终端/伪终端), linenoise 会走 \e[6n 查询回退路径:
+ * 无超时会挂死, 且会吃掉用户已输入的首字符。主动设成 80x24, 让它走 ioctl
+ * 路径, 彻底绕开这条有缺陷的路径。getColumns() 查的是 fd 1, 所以两个都设。 */
+static void ensureWinsize(void) {
+    struct winsize ws;
+    for (int fd = STDIN_FILENO; fd <= STDOUT_FILENO; fd++) {
+        if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col == 0) {
+            ws.ws_col = 80;
+            ws.ws_row = 24;
+            ioctl(fd, TIOCSWINSZ, &ws);
+        }
+    }
+}
 
 /* 行编辑用 linenoise (antirez 同作者的库, redis-cli 同款):
  *   - UTF-8 按字符移动光标, 中文不会碎
@@ -60,6 +75,7 @@ int main(int argc, char **argv) {
     /* 提示符: 默认 you>, /nick 后变为 <昵称>> */
     char prompt[64];
     snprintf(prompt, sizeof(prompt), "you> ");
+    ensureWinsize();
 
     struct linenoiseState l;
     char linebuf[512];

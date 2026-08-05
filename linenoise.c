@@ -121,6 +121,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <stdint.h>
 #include "linenoise.h"
@@ -640,8 +642,15 @@ static int getCursorPosition(int ifd, int ofd) {
     /* Report cursor location */
     if (write(ofd, "\x1b[6n", 4) != 4) return -1;
 
-    /* Read the response: ESC [ rows ; cols R */
+    /* Read the response: ESC [ rows ; cols R.
+     * Vendored patch: 200ms 超时——终端不应答时不能无限阻塞,
+     * 否则 select 事件循环的客户端会整个挂死。 */
     while (i < sizeof(buf)-1) {
+        fd_set rfds;
+        struct timeval tv = {0, 200000};
+        FD_ZERO(&rfds);
+        FD_SET(ifd, &rfds);
+        if (select(ifd+1, &rfds, NULL, NULL, &tv) <= 0) break;
         if (read(ifd,buf+i,1) != 1) break;
         if (buf[i] == 'R') break;
         i++;
