@@ -211,6 +211,10 @@ int main(int argc, char **argv) {
     struct InputBuffer ib;
     inputBufferClear(&ib);
 
+    /* 自己的昵称，/nick 后更新，用于回显前缀 (默认 you> ) */
+    char mynick[32] = "you";
+    int mynicklen = 3;
+
     while(1) {
         FD_ZERO(&readfds);
         FD_SET(s, &readfds);
@@ -241,9 +245,19 @@ int main(int argc, char **argv) {
                     int res = inputBufferFeedChar(&ib,buf[j]);
                     switch(res) {
                     case IB_GOTLINE:
+                        /* 本地跟踪昵称: 输入 /nick <名字> 后回显前缀跟着变 */
+                        if (ib.len > 6 && !memcmp(ib.buf, "/nick ", 6)) {
+                            int alen = ib.len - 6; /* 去掉 "/nick " */
+                            if (alen > 0 && alen < (int)sizeof(mynick)) {
+                                memcpy(mynick, ib.buf + 6, alen);
+                                mynick[alen] = 0;
+                                mynicklen = alen;
+                            }
+                        }
                         inputBufferAppend(&ib,'\n');
                         inputBufferHide(&ib);
-                        write(fileno(stdout),"you> ", 5);
+                        write(fileno(stdout),mynick,mynicklen);
+                        write(fileno(stdout),"> ", 2);
                         write(fileno(stdout),ib.buf,ib.len);
                         write(s,ib.buf,ib.len);
                         inputBufferClear(&ib);

@@ -276,7 +276,7 @@ int main(void) {
                             char *arg = strchr(readbuf, ' ');
                             if (arg) { *arg = 0; arg++; }
 
-                            if (!strcmp(readbuf, "/nick") && arg) {
+                            if (!strcmp(readbuf, "/nick") && arg && arg[0]) {
                                 free(c->nick);
                                 int nicklen = strlen(arg);
                                 c->nick = chatMalloc(nicklen + 1);
@@ -342,7 +342,8 @@ int main(void) {
                                     if (r->password) {
                                         if (!password[0] ||
                                             strcmp(r->password, password)) {
-                                            char *err = "[系统] 密码错误\n";
+                                            char *err =
+                                                "[系统] 密码错误（密码直接跟在房间名后，不带方括号）\n";
                                             write(c->fd, err, strlen(err));
                                             continue;
                                         }
