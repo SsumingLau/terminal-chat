@@ -2,3 +2,5 @@
 smallchat.dSYM
 smallchat-server
 smallchat-client
+.claude/
+logs/
