@@ -144,12 +144,23 @@ void inputBufferShow(struct InputBuffer *ib);
  * the user is typing, so that reading the input buffer 'buf' for 'len'
  * bytes will contain it. */
 int inputBufferFeedChar(struct InputBuffer *ib, int c) {
+    /* 吞掉方向键/Home 等 ESC 序列 (\e[A 等 3 字节), 防止垃圾进入输入行。
+     * 只吞 \e + 下一字节; 若下一字节是 '[' 再吞一个 (完整 CSI 序列)。 */
+    static int escseq = 0;
+    if (escseq) {
+        if (escseq == 2) { escseq = 0; return IB_OK; }
+        escseq = (c == '[') ? 2 : 0;
+        return IB_OK;
+    }
+    if (c == '\e') { escseq = 1; return IB_OK; }
+
     switch(c) {
     case '\n':
         break;          // Ignored. We handle \r instead.
     case '\r':
         return IB_GOTLINE;
-    case 127:           // Backspace.
+    case 8:             // Backspace (某些终端/Windows 发 0x08)
+    case 127:           // Backspace (多数终端发 0x7f)
         if (ib->len > 0) {
             ib->len--;
             inputBufferHide(ib);

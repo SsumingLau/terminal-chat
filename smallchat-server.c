@@ -82,6 +82,24 @@ int createRoom(const char *name, const char *password) {
 /* 注：房间不销毁（内存只占名字+密码，最多 MAX_ROOMS 个），因此
  * 没有 destroyRoom()/roomHasClients()。 */
 
+/* 把控制字符替换成下划线，防止终端转义垃圾进入房间名/昵称/消息 */
+void sanitize(char *s) {
+    for (char *p = s; *p; p++) {
+        unsigned char ch = *p;
+        if (ch < 0x20 && ch != ' ') *p = '_';
+        if (ch == 0x7f) *p = '_';
+    }
+}
+
+/* 去掉密码里的方括号: 创建/加入时无论带不带 []，都归一化成同一种写法 */
+void stripBrackets(char *s) {
+    char *dst = s;
+    for (char *p = s; *p; p++) {
+        if (*p != '[' && *p != ']') *dst++ = *p;
+    }
+    *dst = 0;
+}
+
 /* ============================ Logging ================================== */
 
 FILE *openLogFile(const char *room) {
@@ -288,6 +306,7 @@ int main(void) {
                             if (arg) { *arg = 0; arg++; }
 
                             if (!strcmp(readbuf, "/nick") && arg && arg[0]) {
+                                sanitize(arg);
                                 free(c->nick);
                                 int nicklen = strlen(arg);
                                 c->nick = chatMalloc(nicklen + 1);
@@ -309,6 +328,10 @@ int main(void) {
                                     snprintf(roomname, sizeof(roomname), "%s", arg);
                                     password[0] = 0;
                                 }
+                                /* 清洗: 防止终端转义垃圾进房间名, 密码去方括号归一化 */
+                                sanitize(roomname);
+                                sanitize(password);
+                                stripBrackets(password);
 
                                 /* 已经在同一个房间？ */
                                 if (c->room && !strcasecmp(c->room, roomname)) {
@@ -351,6 +374,7 @@ int main(void) {
                                     /* 房间存在，检查密码 */
                                     struct room *r = Chat->rooms[idx];
                                     if (r->password) {
+                                        stripBrackets(r->password); /* 自愈: 老房间密码带括号也能进 */
                                         if (!password[0] ||
                                             strcmp(r->password, password)) {
                                             char *err =
@@ -442,6 +466,7 @@ int main(void) {
                             }
                         } else {
                             /* 普通消息 */
+                            sanitize(readbuf); /* 防止转义垃圾进日志和别人的终端 */
                             char msg[512];
                             int msglen = snprintf(msg, sizeof(msg),
                                                   "%s> %s", c->nick, readbuf);
