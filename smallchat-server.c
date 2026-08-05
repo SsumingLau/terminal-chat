@@ -1,31 +1,13 @@
-/* smallchat.c -- Read clients input, send to all the other connected clients.
+/* smallchat-server.c — 带房间、密码、聊天记录的终端聊天服务端
  *
- * Copyright (c) 2023, Salvatore Sanfilippo <antirez at gmail dot com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the project name of nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * 基于 antirez/smallchat 修改
+ * 新增:
+ *   - /join <房间> [密码]  加入/创建房间（首次进入即创建）
+ *   - /leave              离开房间回到大厅
+ *   - /rooms              列出所有房间
+ *   - 聊天记录写入 ./logs/<房间>.log，带时间戳
+ *   - 房间常驻：最后一人离开/断线后房间不销毁，直到服务器重启
+ *   - 加入房间时回放最近 20 条历史记录
  */
 
 #include <stdio.h>
@@ -34,94 +16,183 @@
 #include <assert.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
+#include <strings.h>
 #include "chatlib.h"
 
-/* ============================ Data structures =================================
- * The minimal stuff we can afford to have. This example must be simple
- * even for people that don't know a lot of C.
- * =========================================================================== */
+/* ============================ Data structures ========================== */
 
-#define MAX_CLIENTS 1000 // This is actually the higher file descriptor.
+#define MAX_CLIENTS 1000
+#define MAX_ROOMS 100
 #define SERVER_PORT 7711
 
-/* This structure represents a connected client. There is very little
- * info about it: the socket descriptor and the nick name, if set, otherwise
- * the first byte of the nickname is set to 0 if not set.
- * The client can set its nickname with /nick <nickname> command. */
 struct client {
-    int fd;     // Client socket.
-    char *nick; // Nickname of the client.
+    int fd;
+    char *nick;
+    char *room;   /* 当前房间名，NULL = 大厅 */
 };
 
-/* This global structure encapsulates the global state of the chat. */
+struct room {
+    char *name;
+    char *password;   /* NULL = 无密码 */
+};
+
 struct chatState {
-    int serversock;     // Listening server socket.
-    int numclients;     // Number of connected clients right now.
-    int maxclient;      // The greatest 'clients' slot populated.
-    struct client *clients[MAX_CLIENTS]; // Clients are set in the corresponding
-                                         // slot of their socket descriptor.
+    int serversock;
+    int numclients;
+    int maxclient;
+    struct client *clients[MAX_CLIENTS];
+    struct room *rooms[MAX_ROOMS];
+    int numrooms;
 };
 
-struct chatState *Chat; // Initialized at startup.
+struct chatState *Chat;
 
-/* ====================== Small chat core implementation ========================
- * Here the idea is very simple: we accept new connections, read what clients
- * write us and fan-out (that is, send-to-all) the message to everybody
- * with the exception of the sender. And that is, of course, the most
- * simple chat system ever possible.
- * =========================================================================== */
+/* ============================ Room helpers ============================= */
 
-/* Create a new client bound to 'fd'. This is called when a new client
- * connects. As a side effect updates the global Chat state. */
+/* 查找房间，返回 index，不存在返回 -1 */
+int findRoom(const char *name) {
+    for (int i = 0; i < Chat->numrooms; i++) {
+        if (!strcasecmp(Chat->rooms[i]->name, name)) return i;
+    }
+    return -1;
+}
+
+/* 创建房间，返回 index */
+int createRoom(const char *name, const char *password) {
+    struct room *r = chatMalloc(sizeof(*r));
+    int namelen = strlen(name);
+    r->name = chatMalloc(namelen + 1);
+    memcpy(r->name, name, namelen + 1);
+    if (password && password[0]) {
+        int pwlen = strlen(password);
+        r->password = chatMalloc(pwlen + 1);
+        memcpy(r->password, password, pwlen + 1);
+    } else {
+        r->password = NULL;
+    }
+    Chat->rooms[Chat->numrooms] = r;
+    Chat->numrooms++;
+    return Chat->numrooms - 1;
+}
+
+/* 注：房间不销毁（内存只占名字+密码，最多 MAX_ROOMS 个），因此
+ * 没有 destroyRoom()/roomHasClients()。 */
+
+/* ============================ Logging ================================== */
+
+FILE *openLogFile(const char *room) {
+    mkdir("logs", 0755);   /* best-effort, ignore failure */
+    char path[512];
+    if (room) {
+        snprintf(path, sizeof(path), "logs/%s.log", room);
+    } else {
+        snprintf(path, sizeof(path), "logs/lobby.log");
+    }
+    return fopen(path, "a");
+}
+
+void logMessage(const char *room, const char *nick, const char *msg) {
+    FILE *f = openLogFile(room);
+    if (!f) return;
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
+    fprintf(f, "[%s] %s> %s", ts, nick, msg);
+    fclose(f);
+}
+
+/* strdup 的 C99 可移植版本（glibc 在 -std=c99 下不声明 strdup） */
+static char *xstrdup(const char *s) {
+    size_t len = strlen(s);
+    char *d = chatMalloc(len + 1);
+    memcpy(d, s, len + 1);
+    return d;
+}
+
+/* 加入房间时，回放最近 REPLAY_LINES 条历史记录（读文件，不占内存） */
+#define REPLAY_LINES 20
+void replayRoomHistory(int fd, const char *room) {
+    char path[512];
+    snprintf(path, sizeof(path), "logs/%s.log", room);
+    FILE *f = fopen(path, "r");
+    if (!f) return;   /* 新房间还没有记录 */
+
+    char *ring[REPLAY_LINES];
+    memset(ring, 0, sizeof(ring));
+    char buf[1024];
+    int n = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        free(ring[n % REPLAY_LINES]);
+        ring[n % REPLAY_LINES] = xstrdup(buf);
+        n++;
+    }
+    fclose(f);
+    if (n == 0) return;
+
+    int shown = n > REPLAY_LINES ? REPLAY_LINES : n;
+    char head[128];
+    int len = snprintf(head, sizeof(head),
+                       "--- %s 的历史记录 (最近 %d 条) ---\n", room, shown);
+    write(fd, head, len);
+    for (int i = n - shown; i < n; i++) {
+        char *line = ring[i % REPLAY_LINES];
+        if (line) write(fd, line, strlen(line));
+    }
+    char *tail = "--- 历史记录结束 ---\n";
+    write(fd, tail, strlen(tail));
+
+    for (int i = 0; i < REPLAY_LINES; i++) free(ring[i]);
+}
+
+/* ============================ Core ===================================== */
+
 struct client *createClient(int fd) {
-    char nick[32]; // Used to create an initial nick for the user.
-    int nicklen = snprintf(nick,sizeof(nick),"user:%d",fd);
+    char nick[32];
+    int nicklen = snprintf(nick, sizeof(nick), "user:%d", fd);
     struct client *c = chatMalloc(sizeof(*c));
-    socketSetNonBlockNoDelay(fd); // Pretend this will not fail.
+    socketSetNonBlockNoDelay(fd);
     c->fd = fd;
-    c->nick = chatMalloc(nicklen+1);
-    memcpy(c->nick,nick,nicklen);
-    assert(Chat->clients[c->fd] == NULL); // This should be available.
+    c->nick = chatMalloc(nicklen + 1);
+    memcpy(c->nick, nick, nicklen);
+    c->room = NULL;   /* 大厅 */
+    assert(Chat->clients[c->fd] == NULL);
     Chat->clients[c->fd] = c;
-    /* We need to update the max client set if needed. */
     if (c->fd > Chat->maxclient) Chat->maxclient = c->fd;
     Chat->numclients++;
     return c;
 }
 
-/* Free a client, associated resources, and unbind it from the global
- * state in Chat. */
 void freeClient(struct client *c) {
     free(c->nick);
+    if (c->room) free(c->room);   /* 房间本身常驻，不销毁 */
     close(c->fd);
     Chat->clients[c->fd] = NULL;
     Chat->numclients--;
     if (Chat->maxclient == c->fd) {
-        /* Ooops, this was the max client set. Let's find what is
-         * the new highest slot used. */
         int j;
-        for (j = Chat->maxclient-1; j >= 0; j--) {
+        for (j = Chat->maxclient - 1; j >= 0; j--) {
             if (Chat->clients[j] != NULL) {
                 Chat->maxclient = j;
                 break;
             }
         }
-        if (j == -1) Chat->maxclient = -1; // We no longer have clients.
+        if (j == -1) Chat->maxclient = -1;
     }
     free(c);
 }
 
-/* Allocate and init the global stuff. */
 void initChat(void) {
     Chat = chatMalloc(sizeof(*Chat));
-    memset(Chat,0,sizeof(*Chat));
-    /* No clients at startup, of course. */
+    memset(Chat, 0, sizeof(*Chat));
     Chat->maxclient = -1;
     Chat->numclients = 0;
+    Chat->numrooms = 0;
 
-    /* Create our listening socket, bound to the given port. This
-     * is where our clients will connect. */
     Chat->serversock = createTCPServer(SERVER_PORT);
     if (Chat->serversock == -1) {
         perror("Creating listening socket");
@@ -129,149 +200,229 @@ void initChat(void) {
     }
 }
 
-/* Send the specified string to all connected clients but the one
- * having as socket descriptor 'excluded'. If you want to send something
- * to every client just set excluded to an impossible socket: -1. */
-void sendMsgToAllClientsBut(int excluded, char *s, size_t len) {
+/* 发送消息给同一个房间的所有人（除了 excluded） */
+void sendMsgToRoomBut(const char *room, int excluded, char *s, size_t len) {
     for (int j = 0; j <= Chat->maxclient; j++) {
-        if (Chat->clients[j] == NULL ||
-            Chat->clients[j]->fd == excluded) continue;
-
-        /* Important: we don't do ANY BUFFERING. We just use the kernel
-         * socket buffers. If the content does not fit, we don't care.
-         * This is needed in order to keep this program simple. */
-        write(Chat->clients[j]->fd,s,len);
+        if (Chat->clients[j] == NULL || Chat->clients[j]->fd == excluded)
+            continue;
+        struct client *c = Chat->clients[j];
+        /* 同一房间：双方 room 都为 NULL（大厅），或字符串相等 */
+        int sameRoom = (c->room == NULL && room == NULL) ||
+                       (c->room && room && !strcasecmp(c->room, room));
+        if (!sameRoom) continue;
+        write(c->fd, s, len);
     }
 }
 
-/* The main() function implements the main chat logic:
- * 1. Accept new clients connections if any.
- * 2. Check if any client sent us some new message.
- * 3. Send the message to all the other clients. */
 int main(void) {
     initChat();
 
-    while(1) {
+    while (1) {
         fd_set readfds;
         struct timeval tv;
         int retval;
 
         FD_ZERO(&readfds);
-        /* When we want to be notified by select() that there is
-         * activity? If the listening socket has pending clients to accept
-         * or if any other client wrote anything. */
         FD_SET(Chat->serversock, &readfds);
-
         for (int j = 0; j <= Chat->maxclient; j++) {
             if (Chat->clients[j]) FD_SET(j, &readfds);
         }
 
-        /* Set a timeout for select(), see later why this may be useful
-         * in the future (not now). */
-        tv.tv_sec = 1; // 1 sec timeout
+        tv.tv_sec = 1;
         tv.tv_usec = 0;
 
-        /* Select wants as first argument the maximum file descriptor
-         * in use plus one. It can be either one of our clients or the
-         * server socket itself. */
         int maxfd = Chat->maxclient;
         if (maxfd < Chat->serversock) maxfd = Chat->serversock;
-        retval = select(maxfd+1, &readfds, NULL, NULL, &tv);
+        retval = select(maxfd + 1, &readfds, NULL, NULL, &tv);
         if (retval == -1) {
             perror("select() error");
             exit(1);
         } else if (retval) {
 
-            /* If the listening socket is "readable", it actually means
-             * there are new clients connections pending to accept. */
             if (FD_ISSET(Chat->serversock, &readfds)) {
                 int fd = acceptClient(Chat->serversock);
                 struct client *c = createClient(fd);
-                /* Send a welcome message. */
                 char *welcome_msg =
-                    "Welcome to Simple Chat! "
-                    "Use /nick <nick> to set your nick.\n";
-                write(c->fd,welcome_msg,strlen(welcome_msg));
+                    "=== Terminal Chat ===\n"
+                    "/nick <昵称>     设置昵称\n"
+                    "/join <房间> [密码] 加入/创建房间\n"
+                    "/leave           离开房间回大厅\n"
+                    "/rooms           查看所有房间\n"
+                    "====================\n";
+                write(c->fd, welcome_msg, strlen(welcome_msg));
                 printf("Connected client fd=%d\n", fd);
             }
 
-            /* Here for each connected client, check if there are pending
-             * data the client sent us. */
-            char readbuf[256];
+            char readbuf[512];
             for (int j = 0; j <= Chat->maxclient; j++) {
                 if (Chat->clients[j] == NULL) continue;
                 if (FD_ISSET(j, &readfds)) {
-                    /* Here we just hope that there is a well formed
-                     * message waiting for us. But it is entirely possible
-                     * that we read just half a message. In a normal program
-                     * that is not designed to be that simple, we should try
-                     * to buffer reads until the end-of-the-line is reached. */
-                    int nread = read(j,readbuf,sizeof(readbuf)-1);
+                    int nread = read(j, readbuf, sizeof(readbuf) - 1);
 
                     if (nread <= 0) {
-                        /* Error or short read means that the socket
-                         * was closed. */
                         printf("Disconnected client fd=%d, nick=%s\n",
-                            j, Chat->clients[j]->nick);
+                               j, Chat->clients[j]->nick);
                         freeClient(Chat->clients[j]);
                     } else {
-                        /* The client sent us a message. We need to
-                         * relay this message to all the other clients
-                         * in the chat. */
                         struct client *c = Chat->clients[j];
                         readbuf[nread] = 0;
 
-                        /* If the user message starts with "/", we
-                         * process it as a client command. So far
-                         * only the /nick <newnick> command is implemented. */
                         if (readbuf[0] == '/') {
-                            /* Remove any trailing newline. */
+                            /* 去掉尾部 \r \n */
                             char *p;
-                            p = strchr(readbuf,'\r'); if (p) *p = 0;
-                            p = strchr(readbuf,'\n'); if (p) *p = 0;
-                            /* Check for an argument of the command, after
-                             * the space. */
-                            char *arg = strchr(readbuf,' ');
-                            if (arg) {
-                                *arg = 0; /* Terminate command name. */
-                                arg++; /* Argument is 1 byte after the space. */
-                            }
+                            p = strchr(readbuf, '\r'); if (p) *p = 0;
+                            p = strchr(readbuf, '\n'); if (p) *p = 0;
 
-                            if (!strcmp(readbuf,"/nick") && arg) {
+                            char *arg = strchr(readbuf, ' ');
+                            if (arg) { *arg = 0; arg++; }
+
+                            if (!strcmp(readbuf, "/nick") && arg) {
                                 free(c->nick);
                                 int nicklen = strlen(arg);
-                                c->nick = chatMalloc(nicklen+1);
-                                memcpy(c->nick,arg,nicklen+1);
+                                c->nick = chatMalloc(nicklen + 1);
+                                memcpy(c->nick, arg, nicklen + 1);
+                                char ok[256];
+                                int len = snprintf(ok, sizeof(ok),
+                                                   "[系统] 昵称已改为: %s\n", c->nick);
+                                write(c->fd, ok, len);
+
+                            } else if (!strcmp(readbuf, "/join") && arg) {
+                                /* 解析: /join <房间名> [密码] */
+                                char *pass = strchr(arg, ' ');
+                                char roomname[128], password[128];
+                                if (pass) {
+                                    *pass = 0; pass++;
+                                    snprintf(roomname, sizeof(roomname), "%s", arg);
+                                    snprintf(password, sizeof(password), "%s", pass);
+                                } else {
+                                    snprintf(roomname, sizeof(roomname), "%s", arg);
+                                    password[0] = 0;
+                                }
+
+                                /* 已经在同一个房间？ */
+                                if (c->room && !strcasecmp(c->room, roomname)) {
+                                    char *err = "[系统] 你已经在这个房间里了\n";
+                                    write(c->fd, err, strlen(err));
+                                    continue;
+                                }
+
+                                /* 先离开旧房间 */
+                                if (c->room) {
+                                    char leavemsg[256];
+                                    int len = snprintf(leavemsg, sizeof(leavemsg),
+                                                       "[系统] %s 离开了 %s\n",
+                                                       c->nick, c->room);
+                                    sendMsgToRoomBut(c->room, c->fd, leavemsg, len);
+                                    printf("%s", leavemsg);
+                                    free(c->room);
+                                    c->room = NULL;
+                                }
+
+                                int idx = findRoom(roomname);
+                                if (idx == -1) {
+                                    /* 房间不存在，创建 */
+                                    if (Chat->numrooms >= MAX_ROOMS) {
+                                        char *err = "[系统] 房间数量已达上限\n";
+                                        write(c->fd, err, strlen(err));
+                                        continue;
+                                    }
+                                    createRoom(roomname, password[0] ? password : NULL);
+                                    char info[256];
+                                    int len;
+                                    if (password[0])
+                                        len = snprintf(info, sizeof(info),
+                                                       "[系统] 创建带密码房间: %s\n", roomname);
+                                    else
+                                        len = snprintf(info, sizeof(info),
+                                                       "[系统] 创建房间: %s\n", roomname);
+                                    write(c->fd, info, len);
+                                } else {
+                                    /* 房间存在，检查密码 */
+                                    struct room *r = Chat->rooms[idx];
+                                    if (r->password) {
+                                        if (!password[0] ||
+                                            strcmp(r->password, password)) {
+                                            char *err = "[系统] 密码错误\n";
+                                            write(c->fd, err, strlen(err));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                /* 进入房间 */
+                                c->room = chatMalloc(strlen(roomname) + 1);
+                                memcpy(c->room, roomname, strlen(roomname) + 1);
+                                char joinmsg[256];
+                                int len = snprintf(joinmsg, sizeof(joinmsg),
+                                                   "[系统] %s 加入了 %s\n",
+                                                   c->nick, roomname);
+                                printf("%s", joinmsg);
+                                sendMsgToRoomBut(c->room, -1, joinmsg, len);
+
+                                /* 回放该房间最近的历史记录 */
+                                replayRoomHistory(c->fd, c->room);
+
+                            } else if (!strcmp(readbuf, "/leave")) {
+                                if (c->room) {
+                                    char leavemsg[256];
+                                    int len = snprintf(leavemsg, sizeof(leavemsg),
+                                                       "[系统] %s 离开了 %s\n",
+                                                       c->nick, c->room);
+                                    sendMsgToRoomBut(c->room, c->fd, leavemsg, len);
+                                    printf("%s", leavemsg);
+                                    free(c->room);
+                                    c->room = NULL;
+                                    char *ok = "[系统] 已回到大厅\n";
+                                    write(c->fd, ok, strlen(ok));
+                                } else {
+                                    char *err = "[系统] 你不在任何房间里\n";
+                                    write(c->fd, err, strlen(err));
+                                }
+
+                            } else if (!strcmp(readbuf, "/rooms")) {
+                                char list[1024];
+                                int len = snprintf(list, sizeof(list),
+                                                   "=== 房间列表 (%d 个) ===\n", Chat->numrooms);
+                                write(c->fd, list, len);
+                                for (int i = 0; i < Chat->numrooms; i++) {
+                                    struct room *r = Chat->rooms[i];
+                                    int cnt = 0;
+                                    for (int k = 0; k <= Chat->maxclient; k++) {
+                                        if (Chat->clients[k] && Chat->clients[k]->room &&
+                                            !strcasecmp(Chat->clients[k]->room, r->name))
+                                            cnt++;
+                                    }
+                                    len = snprintf(list, sizeof(list),
+                                                   "  %s%s (%d人)\n",
+                                                   r->name,
+                                                   r->password ? " [加密]" : "",
+                                                   cnt);
+                                    write(c->fd, list, len);
+                                }
+                                char *end = "======================\n";
+                                write(c->fd, end, strlen(end));
+
                             } else {
-                                /* Unsupported command. Send an error. */
-                                char *errmsg = "Unsupported command\n";
-                                write(c->fd,errmsg,strlen(errmsg));
+                                char *errmsg = "[系统] 未知命令。可用: /nick /join /leave /rooms\n";
+                                write(c->fd, errmsg, strlen(errmsg));
                             }
                         } else {
-                            /* Create a message to send everybody (and show
-                             * on the server console) in the form:
-                             *   nick> some message. */
-                            char msg[256];
+                            /* 普通消息 */
+                            char msg[512];
                             int msglen = snprintf(msg, sizeof(msg),
-                                "%s> %s", c->nick, readbuf);
-
-                            /* snprintf() return value may be larger than
-                             * sizeof(msg) in case there is no room for the
-                             * whole output. */
+                                                  "%s> %s", c->nick, readbuf);
                             if (msglen >= (int)sizeof(msg))
-                                msglen = sizeof(msg)-1;
-                            printf("%s",msg);
+                                msglen = sizeof(msg) - 1;
+                            printf("%s", msg);
 
-                            /* Send it to all the other clients. */
-                            sendMsgToAllClientsBut(j,msg,msglen);
+                            /* 写入日志 */
+                            logMessage(c->room, c->nick, readbuf);
+
+                            /* 发给同房间所有人 */
+                            sendMsgToRoomBut(c->room, j, msg, msglen);
                         }
                     }
                 }
             }
-        } else {
-            /* Timeout occurred. We don't do anything right now, but in
-             * general this section can be used to wakeup periodically
-             * even if there is no clients activity. */
         }
     }
     return 0;
