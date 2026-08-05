@@ -35,6 +35,7 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <errno.h>
 
 #include "chatlib.h"
 #include "linenoise.h"
