@@ -28,15 +28,12 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-/* 设计说明: 回到 antirez 原版架构 (select + 字节级输入缓冲)。
- * 原版经过长期使用验证: 命令/中文/发送全部正常。
- * 只加了三处小改动:
- *   1. 退格兼容 0x08 与 0x7f (部分终端发 0x08)
- *   2. 吞掉方向键/Delete 等 7位 ESC 序列, 防止垃圾进输入行
- *      (方向键本身无光标移动功能——原版就没有, 需要时再说)
- *   3. /nick 后回显前缀变为 <昵称>>, 新消息终端通知 (OSC9+OSC777+铃音)
- * 注意: 不处理 0x9b (8位CSI) 开头——那是少数终端的行为, 且 0x9b 也是
- * 合法中文的 UTF-8 续字节, 处理它得不偿失。 */
+/* 设计说明: 基于 antirez 原版架构 (select + 字节级输入缓冲)。
+ * 行编辑交给 ledit.c: UTF-8 感知的方向键/Home/End/Delete/退格/历史。
+ * 改动:
+ *   1. 输入行带 prompt (mynick> ), /nick 后跟随更新
+ *   2. /nick 后回显前缀变为 <昵称>>, 新消息终端通知 (OSC9+OSC777+铃音)
+ *   3. Ctrl-D (空行) 退出 */
 
 #define _POSIX_C_SOURCE 200809L /* Linux 严格 C99 下需要, 否则 fileno() 不声明 */
 #include <stdio.h>
@@ -49,6 +46,7 @@
 #include <errno.h>
 
 #include "chatlib.h"
+#include "ledit.h"
 
 /* ============================================================================
  * Low level terminal handling.
@@ -95,89 +93,6 @@ void disableRawModeAtExit(void) {
     setRawMode(STDIN_FILENO, 0);
 }
 
-/* ============================================================================
- * Minimal line editing.
- * ========================================================================== */
-
-void terminalCleanCurrentLine(void) {
-    write(fileno(stdout), "\e[2K", 4);
-}
-
-void terminalCursorAtLineStart(void) {
-    write(fileno(stdout), "\r", 1);
-}
-
-#define IB_MAX 128
-struct InputBuffer {
-    char buf[IB_MAX];
-    int len;
-};
-
-#define IB_ERR 0
-#define IB_OK 1
-#define IB_GOTLINE 2
-
-int inputBufferAppend(struct InputBuffer *ib, int c) {
-    if (ib->len >= IB_MAX) return IB_ERR;
-    ib->buf[ib->len] = c;
-    ib->len++;
-    return IB_OK;
-}
-
-void inputBufferHide(struct InputBuffer *ib);
-void inputBufferShow(struct InputBuffer *ib);
-
-int inputBufferFeedChar(struct InputBuffer *ib, int c) {
-    /* 吞掉方向键/Home/Delete 等 7位 ESC 序列 (\e[A, \e[3~ 等),
-     * 防止垃圾进入输入行。只认 ESC (0x1b) 开头, 与 UTF-8 中文
-     * (0x80+ 字节) 无交集, 不会误吞。 */
-    static int escseq = 0; /* 0=空闲, 1=刚收 ESC, 2=CSI/SS3 序列中 */
-    if (escseq) {
-        if (escseq == 1) {
-            escseq = (c == '[' || c == 'O') ? 2 : 0;
-            return IB_OK;
-        }
-        if (c >= 0x40) escseq = 0; /* CSI 终结字节 (~ @ A-Z a-z) */
-        return IB_OK;
-    }
-    if (c == '\e') { escseq = 1; return IB_OK; }
-
-    switch(c) {
-    case '\n':
-        break;          // Ignored. We handle \r instead.
-    case '\r':
-        return IB_GOTLINE;
-    case 8:             // Backspace (某些终端/Windows 发 0x08)
-    case 127:           // Backspace (多数终端发 0x7f)
-        if (ib->len > 0) {
-            ib->len--;
-            inputBufferHide(ib);
-            inputBufferShow(ib);
-        }
-        break;
-    default:
-        if (inputBufferAppend(ib,c) == IB_OK)
-            write(fileno(stdout),ib->buf+ib->len-1,1);
-        break;
-    }
-    return IB_OK;
-}
-
-void inputBufferHide(struct InputBuffer *ib) {
-    (void)ib;
-    terminalCleanCurrentLine();
-    terminalCursorAtLineStart();
-}
-
-void inputBufferShow(struct InputBuffer *ib) {
-    write(fileno(stdout),ib->buf,ib->len);
-}
-
-void inputBufferClear(struct InputBuffer *ib) {
-    ib->len = 0;
-    inputBufferHide(ib);
-}
-
 /* =============================================================================
  * Main program logic.
  * ========================================================================== */
@@ -199,8 +114,9 @@ int main(int argc, char **argv) {
     fd_set readfds;
     int stdin_fd = fileno(stdin);
 
-    struct InputBuffer ib;
-    inputBufferClear(&ib);
+    /* 行编辑器: UTF-8 感知的方向键/删除/历史 (ledit.c) */
+    LEdit *e = ledit_new();
+    ledit_set_prompt(e, "you> ");
 
     /* 自己的昵称, /nick 后更新, 用于回显前缀 (默认 you> ) */
     char mynick[32] = "you";
@@ -240,33 +156,40 @@ int main(int argc, char **argv) {
                     if (nlen < (int)sizeof(nseq)) /* 截断会损坏转义序列, 宁可不发 */
                         write(fileno(stdout), nseq, nlen);
                 }
-                inputBufferHide(&ib);
+                ledit_hide(e);
                 write(fileno(stdout),buf,count);
-                inputBufferShow(&ib);
+                ledit_show(e);
             } else if (FD_ISSET(stdin_fd, &readfds)) {
                 ssize_t count = read(stdin_fd,buf,sizeof(buf));
                 for (int j = 0; j < count; j++) {
-                    int res = inputBufferFeedChar(&ib,buf[j]);
+                    int res = ledit_feed(e,(unsigned char)buf[j]);
                     switch(res) {
-                    case IB_GOTLINE:
+                    case 1: /* 行就绪 */
                         /* 本地跟踪昵称: /nick 后回显前缀跟着变 */
-                        if (ib.len > 6 && !memcmp(ib.buf, "/nick ", 6)) {
-                            int alen = ib.len - 6; /* 去掉 "/nick " */
-                            if (alen > 0 && alen < (int)sizeof(mynick)) {
-                                memcpy(mynick, ib.buf + 6, alen);
+                        if (e->len > 6 && !memcmp(e->buf, "/nick ", 6)) {
+                            int alen = e->len - 6; /* 去掉 "/nick " */
+                            if (alen > 0 && alen < 28) { /* 留出 "> " 和 NUL */
+                                memcpy(mynick, e->buf + 6, alen);
                                 mynick[alen] = 0;
                                 mynicklen = alen;
+                                char np[32];
+                                snprintf(np, sizeof(np), "%s> ", mynick);
+                                ledit_set_prompt(e, np);
                             }
                         }
-                        inputBufferAppend(&ib,'\n');
-                        inputBufferHide(&ib);
+                        ledit_hide(e);
                         write(fileno(stdout),mynick,mynicklen);
                         write(fileno(stdout),"> ", 2);
-                        write(fileno(stdout),ib.buf,ib.len);
-                        write(s,ib.buf,ib.len);
-                        inputBufferClear(&ib);
+                        write(fileno(stdout),e->buf,e->len);
+                        write(fileno(stdout),"\n", 1);
+                        write(s,e->buf,e->len);
+                        write(s,"\n", 1);
+                        ledit_accept(e);
                         break;
-                    case IB_OK:
+                    case -1: /* EOF: 空行 Ctrl-D */
+                        write(fileno(stdout),"\n", 1);
+                        exit(0);
+                    default:
                         break;
                     }
                 }
