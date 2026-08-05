@@ -9,6 +9,7 @@
 struct InputBuffer {
     char buf[IB_MAX];
     int len;
+    int pos;
 };
 
 int inputBufferFeedChar(struct InputBuffer *ib, int c);
@@ -56,6 +57,49 @@ int main(void) {
     const char *mix2 = "\033[A很好";
     for (const char *p = mix2; *p; p++) inputBufferFeedChar(&ib, *p);
     assert(ib.len == 6 && memcmp(ib.buf, "很好", 6) == 0);
+
+    /* 8. 左右方向键移动光标 + 中间插入 */
+    inputBufferClear(&ib);
+    const char *s8 = "abc";
+    for (const char *p = s8; *p; p++) inputBufferFeedChar(&ib, *p);
+    const char *left = "\033[D";  /* ESC [ D 左移 */
+    for (const char *p = left; *p; p++) inputBufferFeedChar(&ib, *p);
+    assert(ib.pos == 2);
+    inputBufferFeedChar(&ib, 'x'); /* 在 b 和 c 之间插入 */
+    assert(ib.len == 4 && ib.pos == 3 && memcmp(ib.buf, "abxc", 4) == 0);
+    const char *right = "\033[C"; /* ESC [ C 右移 */
+    for (const char *p = right; *p; p++) inputBufferFeedChar(&ib, *p);
+    assert(ib.pos == 4);
+
+    /* 9. Delete 键 (\e[3~) 删除光标处字符 */
+    inputBufferClear(&ib);
+    const char *s9 = "abcd";
+    for (const char *p = s9; *p; p++) inputBufferFeedChar(&ib, *p);
+    for (const char *p = left; *p; p++) inputBufferFeedChar(&ib, *p); /* pos 3 */
+    const char *del = "\033[3~";
+    for (const char *p = del; *p; p++) inputBufferFeedChar(&ib, *p); /* 删 'd' */
+    assert(ib.len == 3 && ib.pos == 3 && memcmp(ib.buf, "abc", 3) == 0);
+
+    /* 10. Home/End */
+    inputBufferClear(&ib);
+    const char *s10 = "abc";
+    for (const char *p = s10; *p; p++) inputBufferFeedChar(&ib, *p);
+    const char *home = "\033[H";
+    for (const char *p = home; *p; p++) inputBufferFeedChar(&ib, *p);
+    assert(ib.pos == 0);
+    inputBufferFeedChar(&ib, 'X');
+    assert(ib.len == 4 && memcmp(ib.buf, "Xabc", 4) == 0);
+    const char *end = "\033[F";
+    for (const char *p = end; *p; p++) inputBufferFeedChar(&ib, *p);
+    assert(ib.pos == 4);
+
+    /* 11. 8位CSI 左方向键 (0x9b D) */
+    inputBufferClear(&ib);
+    const char *s11 = "abcd";
+    for (const char *p = s11; *p; p++) inputBufferFeedChar(&ib, *p);
+    const char *left8 = "\x9b" "D";
+    for (const char *p = left8; *p; p++) inputBufferFeedChar(&ib, *p);
+    assert(ib.pos == 3);
 
     printf("ALL_PASS\n");
     return 0;

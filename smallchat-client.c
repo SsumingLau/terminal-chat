@@ -120,6 +120,7 @@ void terminalCursorAtLineStart(void) {
 struct InputBuffer {
     char buf[IB_MAX];       // Buffer holding the data.
     int len;                // Current length.
+    int pos;                // 光标位置 (0..len).
 };
 
 /* inputBuffer*() return values: */
@@ -138,34 +139,66 @@ int inputBufferAppend(struct InputBuffer *ib, int c) {
 
 void inputBufferHide(struct InputBuffer *ib);
 void inputBufferShow(struct InputBuffer *ib);
+void inputBufferRedraw(struct InputBuffer *ib);
 
 /* Process every new keystroke arriving from the keyboard. As a side effect
  * the input buffer state is modified in order to reflect the current line
  * the user is typing, so that reading the input buffer 'buf' for 'len'
  * bytes will contain it. */
 int inputBufferFeedChar(struct InputBuffer *ib, int c) {
-    /* 吞掉方向键/Home/Delete 等控制序列, 防止垃圾进入输入行。
-     * 两种开头: ESC (0x1b, 7位) 和 0x9b (8位 CSI)。
+    /* 终端控制序列 -> 行内编辑。收集 ESC[/ESC O/0x9b 开头的序列,
+     * 到终结字节 (>=0x40) 后分派:
+     *   左/右: 移动光标; Home/End: 行首/行尾; Delete(\e[3~): 删光标处;
+     *   上/下: 无历史, 忽略。
      * 关键: 0x9b 既可能是 8位CSI 开头, 也可能是 UTF-8 续字节
-     * ("些"=E4 BA 9B), 必须靠 utf8_pending 区分——跟在多字节字符
-     * 中间的 0x9b 是文字, 不能吞。
-     * '[' 或 'O' 之后的 CSI/SS3 序列一直吞到终结字节 (>=0x40),
-     * 这样 \e[A (3字节) 和 \e[3~ (Delete, 4字节) 都能正确处理。 */
-    static int escseq = 0;      /* 0=空闲, 1=刚收开头, 2=CSI 序列中 */
+     * ("些"=E4 BA 9B), 靠 utf8_pending 区分——多字节字符中间的
+     * 0x9b 是文字, 不能当序列。 */
     static int utf8_pending = 0; /* 当前 UTF-8 字符还需多少个续字节 */
+    static char seq[8];          /* 控制序列缓冲 */
+    static int seql = 0;         /* 序列长度 */
+
     unsigned char u = (unsigned char)c;
 
-    if (escseq) {
-        if (escseq == 1) {
-            escseq = (u == '[' || u == 'O') ? 2 : 0;
-            return IB_OK;
-        }
-        if (u >= 0x40) escseq = 0; /* CSI 终结字节 (~ @ A-Z a-z) */
+    /* 序列开始: ESC, 或独立的 0x9b (8位CSI, 等价于 ESC [) */
+    if (u == '\e' || (u == 0x9b && utf8_pending == 0)) {
+        if (u == 0x9b) { seq[0] = '\e'; seq[1] = '['; seql = 2; }
+        else           { seq[0] = '\e'; seql = 1; }
+        utf8_pending = 0;
         return IB_OK;
     }
-    if (u == '\e' || (u == 0x9b && utf8_pending == 0)) {
-        escseq = 1;
-        utf8_pending = 0;
+    if (seql > 0) {
+        if (seql < (int)sizeof(seq)) seq[seql] = u;
+        if (++seql > (int)sizeof(seq)) { seql = 0; return IB_OK; }
+        /* ESC + 非 [ 非 O: 不是 CSI/SS3, 整个丢弃 */
+        if (seql == 2 && seq[0] == '\e' && seq[1] != '[' && seq[1] != 'O') {
+            seql = 0;
+            return IB_OK;
+        }
+        if (u >= 0x40 && seql >= 3) { /* >=3: ESC+引导符([/O)+终结字节; '['本身也是0x5B不能算终结 */
+            char *s = seq;
+            int sl = seql;
+            seql = 0;
+            if (sl == 3 && (s[1] == '[' || s[1] == 'O')) {
+                switch (s[2]) {
+                case 'D': if (ib->pos > 0) { ib->pos--; inputBufferRedraw(ib); } return IB_OK; /* 左 */
+                case 'C': if (ib->pos < ib->len) { ib->pos++; inputBufferRedraw(ib); } return IB_OK; /* 右 */
+                case 'H': ib->pos = 0; inputBufferRedraw(ib); return IB_OK;           /* Home */
+                case 'F': ib->pos = ib->len; inputBufferRedraw(ib); return IB_OK;     /* End */
+                default:  return IB_OK; /* 上/下等, 无功能, 忽略 */
+                }
+            }
+            if (sl == 4 && s[1] == '[' && s[2] == '3' && s[3] == '~') {
+                /* Delete 键: 删除光标处字符 */
+                if (ib->pos < ib->len) {
+                    memmove(ib->buf + ib->pos, ib->buf + ib->pos + 1,
+                            ib->len - ib->pos - 1);
+                    ib->len--;
+                    inputBufferRedraw(ib);
+                }
+                return IB_OK;
+            }
+            return IB_OK; /* 其他序列, 忽略 */
+        }
         return IB_OK;
     }
 
@@ -187,15 +220,24 @@ int inputBufferFeedChar(struct InputBuffer *ib, int c) {
         return IB_GOTLINE;
     case 8:             // Backspace (某些终端/Windows 发 0x08)
     case 127:           // Backspace (多数终端发 0x7f)
-        if (ib->len > 0) {
+        if (ib->pos > 0) {
+            memmove(ib->buf + ib->pos - 1, ib->buf + ib->pos,
+                    ib->len - ib->pos);
             ib->len--;
-            inputBufferHide(ib);
-            inputBufferShow(ib);
+            ib->pos--;
+            inputBufferRedraw(ib);
         }
         break;
     default:
-        if (inputBufferAppend(ib,c) == IB_OK)
-            write(fileno(stdout),ib->buf+ib->len-1,1);
+        if (ib->len < IB_MAX) {
+            /* 在光标处插入 */
+            memmove(ib->buf + ib->pos + 1, ib->buf + ib->pos,
+                    ib->len - ib->pos);
+            ib->buf[ib->pos] = c;
+            ib->len++;
+            ib->pos++;
+            inputBufferRedraw(ib);
+        }
         break;
     }
     return IB_OK;
@@ -211,11 +253,24 @@ void inputBufferHide(struct InputBuffer *ib) {
 /* Show again the current line. Usually called after InputBufferHide(). */
 void inputBufferShow(struct InputBuffer *ib) {
     write(fileno(stdout),ib->buf,ib->len);
+    /* 光标不在行尾时, 移回到编辑位置 */
+    if (ib->pos < ib->len) {
+        char seq[16];
+        int n = snprintf(seq,sizeof(seq),"\e[%dD",ib->len-ib->pos);
+        write(fileno(stdout),seq,n);
+    }
+}
+
+/* 清行重绘: 光标移动/插入/删除后刷新输入行显示 */
+void inputBufferRedraw(struct InputBuffer *ib) {
+    inputBufferHide(ib);
+    inputBufferShow(ib);
 }
 
 /* Reset the buffer to be empty. */
 void inputBufferClear(struct InputBuffer *ib) {
     ib->len = 0;
+    ib->pos = 0;
     inputBufferHide(ib);
 }
 
