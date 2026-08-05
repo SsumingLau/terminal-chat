@@ -21,6 +21,15 @@
 - make 时间戳秒级相同会漏重建, 必要时 `make -B`。
 - 集成测试用 pty(测试脚本经验: 抓取要 select 循环 drain, 一次非阻塞读会漏数据; 客户端 pty 不 drain 会写阻塞; pty 下 `\n` 被 ONLCR 变 `\r\n`)。
 
+## 待办: 加密功能(用户要求, 已思考未实施)
+
+现状: 明文 TCP/HTTP, 消息和密码裸奔。用户小圈子场景, 传输加密足够(不做 E2E, 服务器是自己的)。
+
+方案(推荐顺序):
+1. **网页端 = HTTPS**: 需要域名(阿里云可买, Let's Encrypt 不发 IP 证书)+ nginx 反代 7712。配置活, 零应用代码。
+2. **终端客户端 = 应用层加密**: 房间密码派生密钥 + ChaCha20-Poly1305(零依赖自实现 ~300 行, 须用 RFC 8439 测试向量验证; 或用 libsodium 但破坏零依赖)。服务器需区分"加密终端"和"明文网页"连接(或等网页也 HTTPS 后统一)。
+3. 不做 E2E(服务器保留明文转发, 消息互通简单)。
+
 ## Git / Release
 - remote: `git@github.com:SsumingLau/terminal-chat.git`(SSH 免密 push)。
 - Release v1.0.0 已建; 更新附件 = 重新打 tar 放 `~/Downloads/terminal-chat-src.tar.gz` + macOS universal 客户端, 网页上传覆盖。
