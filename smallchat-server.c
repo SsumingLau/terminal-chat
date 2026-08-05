@@ -33,6 +33,8 @@ struct client {
     int fd;
     char *nick;
     char *room;   /* 当前房间名，NULL = 大厅 */
+    char inbuf[512]; /* 行缓冲: 一次 read 可能含多行或半行 */
+    int inlen;
 };
 
 struct room {
@@ -294,18 +296,28 @@ int main(void) {
                         freeClient(Chat->clients[j]);
                     } else {
                         struct client *c = Chat->clients[j];
-                        readbuf[nread] = 0;
+                        /* 累积到每客户端行缓冲, 按 \n 逐行处理
+                         * (一次 read 可能含多行, 也可能只含半行) */
+                        if (c->inlen + nread >= (int)sizeof(c->inbuf))
+                            c->inlen = 0; /* 超长行: 丢弃防滥用 */
+                        memcpy(c->inbuf + c->inlen, readbuf, nread);
+                        c->inlen += nread;
+                        while (c->inlen > 0) {
+                            char *nl = memchr(c->inbuf, '\n', c->inlen);
+                            if (nl == NULL) break; /* 半行, 等下一包 */
+                            *nl = 0;
+                            int used = nl - c->inbuf + 1;
+                            char *line = c->inbuf;
 
-                        if (readbuf[0] == '/') {
-                            /* 去掉尾部 \r \n */
+                        if (line[0] == '/') {
+                            /* 去掉尾部 \r (行尾 \n 已在上方消费) */
                             char *p;
-                            p = strchr(readbuf, '\r'); if (p) *p = 0;
-                            p = strchr(readbuf, '\n'); if (p) *p = 0;
+                            p = strchr(line, '\r'); if (p) *p = 0;
 
-                            char *arg = strchr(readbuf, ' ');
+                            char *arg = strchr(line, ' ');
                             if (arg) { *arg = 0; arg++; }
 
-                            if (!strcmp(readbuf, "/nick") && arg && arg[0]) {
+                            if (!strcmp(line, "/nick") && arg && arg[0]) {
                                 sanitize(arg);
                                 free(c->nick);
                                 int nicklen = strlen(arg);
@@ -316,7 +328,7 @@ int main(void) {
                                                    "[系统] 昵称已改为: %s\n", c->nick);
                                 write(c->fd, ok, len);
 
-                            } else if (!strcmp(readbuf, "/join") && arg) {
+                            } else if (!strcmp(line, "/join") && arg) {
                                 /* 解析: /join <房间名> [密码] */
                                 char *pass = strchr(arg, ' ');
                                 char roomname[128], password[128];
@@ -337,7 +349,7 @@ int main(void) {
                                 if (c->room && !strcasecmp(c->room, roomname)) {
                                     char *err = "[系统] 你已经在这个房间里了\n";
                                     write(c->fd, err, strlen(err));
-                                    continue;
+                                    goto done;
                                 }
 
                                 /* 先离开旧房间 */
@@ -358,7 +370,7 @@ int main(void) {
                                     if (Chat->numrooms >= MAX_ROOMS) {
                                         char *err = "[系统] 房间数量已达上限\n";
                                         write(c->fd, err, strlen(err));
-                                        continue;
+                                        goto done;
                                     }
                                     createRoom(roomname, password[0] ? password : NULL);
                                     char info[256];
@@ -380,7 +392,7 @@ int main(void) {
                                             char *err =
                                                 "[系统] 密码错误（密码直接跟在房间名后，不带方括号）\n";
                                             write(c->fd, err, strlen(err));
-                                            continue;
+                                            goto done;
                                         }
                                     }
                                 }
@@ -397,7 +409,7 @@ int main(void) {
                                 /* 回放该房间最近的历史记录 */
                                 replayRoomHistory(c->fd, c->room);
 
-                            } else if (!strcmp(readbuf, "/leave")) {
+                            } else if (!strcmp(line, "/leave")) {
                                 if (c->room) {
                                     char leavemsg[256];
                                     int len = snprintf(leavemsg, sizeof(leavemsg),
@@ -414,7 +426,7 @@ int main(void) {
                                     write(c->fd, err, strlen(err));
                                 }
 
-                            } else if (!strcmp(readbuf, "/rooms")) {
+                            } else if (!strcmp(line, "/rooms")) {
                                 char list[1024];
                                 int len = snprintf(list, sizeof(list),
                                                    "=== 房间列表 (%d 个) ===\n", Chat->numrooms);
@@ -437,7 +449,7 @@ int main(void) {
                                 char *end = "======================\n";
                                 write(c->fd, end, strlen(end));
 
-                            } else if (!strcmp(readbuf, "/who")) {
+                            } else if (!strcmp(line, "/who")) {
                                 /* 列出当前房间(或大厅)的在线用户 */
                                 char list[1024];
                                 int len = snprintf(list, sizeof(list),
@@ -466,24 +478,30 @@ int main(void) {
                             }
                         } else {
                             /* 普通消息 */
-                            sanitize(readbuf); /* 防止转义垃圾进日志和别人的终端 */
+                            sanitize(line); /* 防止转义垃圾进日志和别人的终端 */
                             char msg[512];
                             int msglen = snprintf(msg, sizeof(msg),
-                                                  "%s> %s", c->nick, readbuf);
+                                                  "%s> %s", c->nick, line);
                             if (msglen >= (int)sizeof(msg))
                                 msglen = sizeof(msg) - 1;
                             printf("%s", msg);
 
                             /* 写入日志 */
-                            logMessage(c->room, c->nick, readbuf);
+                            logMessage(c->room, c->nick, line);
 
                             /* 发给同房间所有人 */
                             sendMsgToRoomBut(c->room, j, msg, msglen);
                         }
+                        done: ; /* goto 目标 */
+                        /* 处理完再前移剩余部分 (先 memmove 会盖掉行内容) */
+                        memmove(c->inbuf, nl + 1, c->inlen - used);
+                        c->inlen -= used;
+                        c->inbuf[c->inlen] = 0;
                     }
                 }
             }
         }
+    }
     }
     return 0;
 }
