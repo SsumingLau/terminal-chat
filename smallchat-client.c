@@ -235,6 +235,21 @@ int main(int argc, char **argv) {
                     printf("Connection lost\n");
                     exit(1);
                 }
+                /* 终端通知: 仅真实消息(以昵称开头), 跳过 [系统] 和历史回放。
+                 * 兼容性三连发: 铃音 + OSC9(iTerm2等) + OSC777(Ghostty/WezTerm)。
+                 * 不支持的终端会静默忽略这些序列。 */
+                if (count > 0 && buf[0] != '[') {
+                    int blen = 0;
+                    while (blen < count && blen < 60 && buf[blen] != '\n') blen++;
+                    char nbody[64];
+                    memcpy(nbody, buf, blen);
+                    nbody[blen] = 0;
+                    char nseq[192];
+                    int nlen = snprintf(nseq, sizeof(nseq),
+                        "\a\e]9;%s\a\e]777;notify;Chat;%s\a", nbody, nbody);
+                    if (nlen < (int)sizeof(nseq)) /* 截断会损坏转义序列, 宁可不发 */
+                        write(fileno(stdout), nseq, nlen);
+                }
                 inputBufferHide(&ib);
                 write(fileno(stdout),buf,count);
                 inputBufferShow(&ib);

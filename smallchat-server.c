@@ -167,7 +167,17 @@ struct client *createClient(int fd) {
     return c;
 }
 
+void sendMsgToRoomBut(const char *room, int excluded, char *s, size_t len);
+
 void freeClient(struct client *c) {
+    /* 断线(非 /leave)也要通知同房间其他人 */
+    if (c->room) {
+        char leavemsg[256];
+        int len = snprintf(leavemsg, sizeof(leavemsg),
+                           "[系统] %s 断线离开了 %s\n", c->nick, c->room);
+        sendMsgToRoomBut(c->room, c->fd, leavemsg, len);
+        printf("%s", leavemsg);
+    }
     free(c->nick);
     if (c->room) free(c->room);   /* 房间本身常驻，不销毁 */
     close(c->fd);
@@ -248,6 +258,7 @@ int main(void) {
                     "/join <房间> [密码] 加入/创建房间\n"
                     "/leave           离开房间回大厅\n"
                     "/rooms           查看所有房间\n"
+                    "/who             查看当前房间在线用户\n"
                     "====================\n";
                 write(c->fd, welcome_msg, strlen(welcome_msg));
                 printf("Connected client fd=%d\n", fd);
@@ -402,8 +413,31 @@ int main(void) {
                                 char *end = "======================\n";
                                 write(c->fd, end, strlen(end));
 
+                            } else if (!strcmp(readbuf, "/who")) {
+                                /* 列出当前房间(或大厅)的在线用户 */
+                                char list[1024];
+                                int len = snprintf(list, sizeof(list),
+                                                   "=== %s 在线 ===\n",
+                                                   c->room ? c->room : "大厅");
+                                write(c->fd, list, len);
+                                for (int k = 0; k <= Chat->maxclient; k++) {
+                                    struct client *o = Chat->clients[k];
+                                    if (o == NULL) continue;
+                                    if (c->room == NULL) {
+                                        if (o->room != NULL) continue;
+                                    } else {
+                                        if (o->room == NULL ||
+                                            strcasecmp(o->room, c->room))
+                                            continue;
+                                    }
+                                    len = snprintf(list, sizeof(list), "  %s\n", o->nick);
+                                    write(c->fd, list, len);
+                                }
+                                char *end = "=====================\n";
+                                write(c->fd, end, strlen(end));
+
                             } else {
-                                char *errmsg = "[系统] 未知命令。可用: /nick /join /leave /rooms\n";
+                                char *errmsg = "[系统] 未知命令。可用: /nick /join /leave /rooms /who\n";
                                 write(c->fd, errmsg, strlen(errmsg));
                             }
                         } else {
