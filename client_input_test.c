@@ -39,6 +39,24 @@ int main(void) {
     inputBufferFeedChar(&ib, 0x7f); inputBufferFeedChar(&ib, 0x08);
     assert(ib.len == 0);
 
+    /* 5. 含 0x9b 续字节的中文不能被吞 ("一些"=E4 B8 80 E4 BA 9B) */
+    inputBufferClear(&ib);
+    const char *cn = "一些";
+    for (const char *p = cn; *p; p++) inputBufferFeedChar(&ib, *p);
+    assert(ib.len == 6 && memcmp(ib.buf, "一些", 6) == 0);
+
+    /* 6. 8位CSI + 中文混合: 只吞序列, 文字完整 */
+    inputBufferClear(&ib);
+    const char *mix = "\x9b" "A好";
+    for (const char *p = mix; *p; p++) inputBufferFeedChar(&ib, *p);
+    assert(ib.len == 3 && memcmp(ib.buf, "好", 3) == 0);
+
+    /* 7. ESC方向键 + 中文混合 */
+    inputBufferClear(&ib);
+    const char *mix2 = "\033[A很好";
+    for (const char *p = mix2; *p; p++) inputBufferFeedChar(&ib, *p);
+    assert(ib.len == 6 && memcmp(ib.buf, "很好", 6) == 0);
+
     printf("ALL_PASS\n");
     return 0;
 }

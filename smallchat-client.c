@@ -146,19 +146,39 @@ void inputBufferShow(struct InputBuffer *ib);
 int inputBufferFeedChar(struct InputBuffer *ib, int c) {
     /* 吞掉方向键/Home/Delete 等控制序列, 防止垃圾进入输入行。
      * 两种开头: ESC (0x1b, 7位) 和 0x9b (8位 CSI)。
-     * 若下一字节是 '[' 或 'O' 则是 CSI/SS3 序列, 一直吞到终结字节 (>=0x40),
+     * 关键: 0x9b 既可能是 8位CSI 开头, 也可能是 UTF-8 续字节
+     * ("些"=E4 BA 9B), 必须靠 utf8_pending 区分——跟在多字节字符
+     * 中间的 0x9b 是文字, 不能吞。
+     * '[' 或 'O' 之后的 CSI/SS3 序列一直吞到终结字节 (>=0x40),
      * 这样 \e[A (3字节) 和 \e[3~ (Delete, 4字节) 都能正确处理。 */
-    static int escseq = 0; /* 0=空闲, 1=刚收到开头, 2=CSI 序列中 */
+    static int escseq = 0;      /* 0=空闲, 1=刚收开头, 2=CSI 序列中 */
+    static int utf8_pending = 0; /* 当前 UTF-8 字符还需多少个续字节 */
+    unsigned char u = (unsigned char)c;
+
     if (escseq) {
         if (escseq == 1) {
-            escseq = (c == '[' || c == 'O') ? 2 : 0;
+            escseq = (u == '[' || u == 'O') ? 2 : 0;
             return IB_OK;
         }
-        if (c >= 0x40) escseq = 0; /* CSI 终结字节 (~ @ A-Z a-z) */
+        if (u >= 0x40) escseq = 0; /* CSI 终结字节 (~ @ A-Z a-z) */
         return IB_OK;
     }
-    /* 注意: 字节流经 char->int 是符号扩展, 0x9b 会变成负数, 必须转 unsigned 比较 */
-    if (c == '\e' || (unsigned char)c == 0x9b) { escseq = 1; return IB_OK; }
+    if (u == '\e' || (u == 0x9b && utf8_pending == 0)) {
+        escseq = 1;
+        utf8_pending = 0;
+        return IB_OK;
+    }
+
+    /* 维护 UTF-8 解码状态, 以便区分续字节与控制字节 */
+    if (utf8_pending > 0) {
+        utf8_pending--;
+    } else if (u >= 0xc2 && u <= 0xdf) {
+        utf8_pending = 1;
+    } else if (u >= 0xe0 && u <= 0xef) {
+        utf8_pending = 2;
+    } else if (u >= 0xf0 && u <= 0xf4) {
+        utf8_pending = 3;
+    }
 
     switch(c) {
     case '\n':
