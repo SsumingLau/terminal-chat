@@ -28,37 +28,159 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* 设计说明: 回到 antirez 原版架构 (select + 字节级输入缓冲)。
+ * 原版经过长期使用验证: 命令/中文/发送全部正常。
+ * 只加了三处小改动:
+ *   1. 退格兼容 0x08 与 0x7f (部分终端发 0x08)
+ *   2. 吞掉方向键/Delete 等 7位 ESC 序列, 防止垃圾进输入行
+ *      (方向键本身无光标移动功能——原版就没有, 需要时再说)
+ *   3. /nick 后回显前缀变为 <昵称>>, 新消息终端通知 (OSC9+OSC777+铃音)
+ * 注意: 不处理 0x9b (8位CSI) 开头——那是少数终端的行为, 且 0x9b 也是
+ * 合法中文的 UTF-8 续字节, 处理它得不偿失。 */
+
 #define _POSIX_C_SOURCE 200809L /* Linux 严格 C99 下需要, 否则 fileno() 不声明 */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <assert.h>
 #include <sys/select.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
+#include <termios.h>
 #include <errno.h>
 
 #include "chatlib.h"
-#include "linenoise.h"
 
-/* 若终端窗口尺寸为 0 (部分终端/伪终端), linenoise 会走 \e[6n 查询回退路径:
- * 无超时会挂死, 且会吃掉用户已输入的首字符。主动设成 80x24, 让它走 ioctl
- * 路径, 彻底绕开这条有缺陷的路径。getColumns() 查的是 fd 1, 所以两个都设。 */
-static void ensureWinsize(void) {
-    struct winsize ws;
-    for (int fd = STDIN_FILENO; fd <= STDOUT_FILENO; fd++) {
-        if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col == 0) {
-            ws.ws_col = 80;
-            ws.ws_row = 24;
-            ioctl(fd, TIOCSWINSZ, &ws);
-        }
+/* ============================================================================
+ * Low level terminal handling.
+ * ========================================================================== */
+
+void disableRawModeAtExit(void);
+
+int setRawMode(int fd, int enable) {
+    static struct termios orig_termios;
+    static int atexit_registered = 0;
+    static int rawmode_is_set = 0;
+
+    struct termios raw;
+
+    if (enable == 0) {
+        if (rawmode_is_set && tcsetattr(fd, TCSAFLUSH, &orig_termios) != -1)
+            rawmode_is_set = 0;
+        return 0;
     }
+
+    if (!isatty(fd)) goto fatal;
+    if (!atexit_registered) {
+        atexit(disableRawModeAtExit);
+        atexit_registered = 1;
+    }
+    if (tcgetattr(fd, &orig_termios) == -1) goto fatal;
+
+    raw = orig_termios;
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_cflag |= (CS8);
+    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN);
+    raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(fd, TCSAFLUSH, &raw) < 0) goto fatal;
+    rawmode_is_set = 1;
+    return 0;
+
+fatal:
+    errno = ENOTTY;
+    return -1;
 }
 
-/* 行编辑用 linenoise (antirez 同作者的库, redis-cli 同款):
- *   - UTF-8 按字符移动光标, 中文不会碎
- *   - 方向键/Home/End/Delete/退格齐全, ↑↓ 还有历史
- *   - 多路复用 API (EditStart/Feed/Stop + Hide/Show) 适配 select 循环,
- *     消息到达时隐藏输入行, 打印完恢复 */
+void disableRawModeAtExit(void) {
+    setRawMode(STDIN_FILENO, 0);
+}
+
+/* ============================================================================
+ * Minimal line editing.
+ * ========================================================================== */
+
+void terminalCleanCurrentLine(void) {
+    write(fileno(stdout), "\e[2K", 4);
+}
+
+void terminalCursorAtLineStart(void) {
+    write(fileno(stdout), "\r", 1);
+}
+
+#define IB_MAX 128
+struct InputBuffer {
+    char buf[IB_MAX];
+    int len;
+};
+
+#define IB_ERR 0
+#define IB_OK 1
+#define IB_GOTLINE 2
+
+int inputBufferAppend(struct InputBuffer *ib, int c) {
+    if (ib->len >= IB_MAX) return IB_ERR;
+    ib->buf[ib->len] = c;
+    ib->len++;
+    return IB_OK;
+}
+
+void inputBufferHide(struct InputBuffer *ib);
+void inputBufferShow(struct InputBuffer *ib);
+
+int inputBufferFeedChar(struct InputBuffer *ib, int c) {
+    /* 吞掉方向键/Home/Delete 等 7位 ESC 序列 (\e[A, \e[3~ 等),
+     * 防止垃圾进入输入行。只认 ESC (0x1b) 开头, 与 UTF-8 中文
+     * (0x80+ 字节) 无交集, 不会误吞。 */
+    static int escseq = 0; /* 0=空闲, 1=刚收 ESC, 2=CSI/SS3 序列中 */
+    if (escseq) {
+        if (escseq == 1) {
+            escseq = (c == '[' || c == 'O') ? 2 : 0;
+            return IB_OK;
+        }
+        if (c >= 0x40) escseq = 0; /* CSI 终结字节 (~ @ A-Z a-z) */
+        return IB_OK;
+    }
+    if (c == '\e') { escseq = 1; return IB_OK; }
+
+    switch(c) {
+    case '\n':
+        break;          // Ignored. We handle \r instead.
+    case '\r':
+        return IB_GOTLINE;
+    case 8:             // Backspace (某些终端/Windows 发 0x08)
+    case 127:           // Backspace (多数终端发 0x7f)
+        if (ib->len > 0) {
+            ib->len--;
+            inputBufferHide(ib);
+            inputBufferShow(ib);
+        }
+        break;
+    default:
+        if (inputBufferAppend(ib,c) == IB_OK)
+            write(fileno(stdout),ib->buf+ib->len-1,1);
+        break;
+    }
+    return IB_OK;
+}
+
+void inputBufferHide(struct InputBuffer *ib) {
+    (void)ib;
+    terminalCleanCurrentLine();
+    terminalCursorAtLineStart();
+}
+
+void inputBufferShow(struct InputBuffer *ib) {
+    write(fileno(stdout),ib->buf,ib->len);
+}
+
+void inputBufferClear(struct InputBuffer *ib) {
+    ib->len = 0;
+    inputBufferHide(ib);
+}
+
+/* =============================================================================
+ * Main program logic.
+ * ========================================================================== */
 
 int main(int argc, char **argv) {
     if (argc != 3) {
@@ -66,52 +188,39 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
-    /* Create a TCP connection with the server. */
-    int s = TCPConnect(argv[1], atoi(argv[2]), 0);
+    int s = TCPConnect(argv[1],atoi(argv[2]),0);
     if (s == -1) {
         perror("Connecting to server");
         exit(1);
     }
 
-    /* 提示符: 默认 you>, /nick 后变为 <昵称>> */
-    char prompt[64];
-    snprintf(prompt, sizeof(prompt), "you> ");
-    ensureWinsize();
+    setRawMode(fileno(stdin),1);
 
-    struct linenoiseState l;
-    char linebuf[512];
-    int editing = 0;  /* 当前是否在编辑输入行 */
+    fd_set readfds;
     int stdin_fd = fileno(stdin);
-    FILE *dbgf = NULL;
-    if (getenv("CHAT_DEBUG")) {
-        dbgf = fopen("/tmp/chatdbg.log", "w");
-        if (dbgf) setvbuf(dbgf, NULL, _IONBF, 0);
-    }
 
-    while (1) {
-        fd_set readfds;
+    struct InputBuffer ib;
+    inputBufferClear(&ib);
+
+    /* 自己的昵称, /nick 后更新, 用于回显前缀 (默认 you> ) */
+    char mynick[32] = "you";
+    int mynicklen = 3;
+
+    while(1) {
         FD_ZERO(&readfds);
         FD_SET(s, &readfds);
         FD_SET(stdin_fd, &readfds);
         int maxfd = s > stdin_fd ? s : stdin_fd;
 
-        int num_events = select(maxfd + 1, &readfds, NULL, NULL, NULL);
-        if (dbgf)
-            fprintf(dbgf, "sel=%d s=%d in=%d edit=%d\n",
-                    num_events,
-                    FD_ISSET(s, &readfds) ? 1 : 0,
-                    FD_ISSET(stdin_fd, &readfds) ? 1 : 0,
-                    editing);
+        int num_events = select(maxfd+1, &readfds, NULL, NULL, NULL);
         if (num_events == -1) {
             perror("select() error");
             exit(1);
         } else if (num_events) {
-            char buf[1024]; /* Generic buffer for both code paths. */
+            char buf[1024];
 
             if (FD_ISSET(s, &readfds)) {
-                /* Data from the server? */
-                ssize_t count = read(s, buf, sizeof(buf));
-                if (dbgf) fprintf(dbgf, "  sock_read=%zd\n", count);
+                ssize_t count = read(s,buf,sizeof(buf));
                 if (count <= 0) {
                     printf("Connection lost\n");
                     exit(1);
@@ -131,54 +240,40 @@ int main(int argc, char **argv) {
                     if (nlen < (int)sizeof(nseq)) /* 截断会损坏转义序列, 宁可不发 */
                         write(fileno(stdout), nseq, nlen);
                 }
-                if (editing) linenoiseHide(&l);
-                write(fileno(stdout), buf, count);
-                if (editing) linenoiseShow(&l);
+                inputBufferHide(&ib);
+                write(fileno(stdout),buf,count);
+                inputBufferShow(&ib);
             } else if (FD_ISSET(stdin_fd, &readfds)) {
-                /* 用户输入: 交给 linenoise 编辑 */
-                if (!editing) {
-                    int r = linenoiseEditStart(&l, stdin_fd, fileno(stdout),
-                                           linebuf, sizeof(linebuf), prompt);
-                    if (dbgf) fprintf(dbgf, "  EditStart=%d\n", r);
-                    if (r == -1) {
-                        perror("linenoiseEditStart");
-                        exit(1);
+                ssize_t count = read(stdin_fd,buf,sizeof(buf));
+                for (int j = 0; j < count; j++) {
+                    int res = inputBufferFeedChar(&ib,buf[j]);
+                    switch(res) {
+                    case IB_GOTLINE:
+                        /* 本地跟踪昵称: /nick 后回显前缀跟着变 */
+                        if (ib.len > 6 && !memcmp(ib.buf, "/nick ", 6)) {
+                            int alen = ib.len - 6; /* 去掉 "/nick " */
+                            if (alen > 0 && alen < (int)sizeof(mynick)) {
+                                memcpy(mynick, ib.buf + 6, alen);
+                                mynick[alen] = 0;
+                                mynicklen = alen;
+                            }
+                        }
+                        inputBufferAppend(&ib,'\n');
+                        inputBufferHide(&ib);
+                        write(fileno(stdout),mynick,mynicklen);
+                        write(fileno(stdout),"> ", 2);
+                        write(fileno(stdout),ib.buf,ib.len);
+                        write(s,ib.buf,ib.len);
+                        inputBufferClear(&ib);
+                        break;
+                    case IB_OK:
+                        break;
                     }
-                    editing = 1;
                 }
-                char *res = linenoiseEditFeed(&l);
-                if (dbgf)
-                    fprintf(dbgf, "  feed=%s errno=%d\n",
-                            res == NULL ? "NULL" :
-                            res == linenoiseEditMore ? "MORE" : "LINE",
-                            errno);
-                if (res == NULL && errno == EINTR) {
-                    /* 被信号(如 SIGWINCH)打断的读: 不是真退出, 继续编辑 */
-                    if (dbgf) fprintf(dbgf, "  EINTR -> continue\n");
-                    continue;
-                }
-                if (res == NULL) {
-                    /* Ctrl+C / Ctrl+D: 退出 */
-                    printf("\nBye.\n");
-                    exit(0);
-                }
-                if (res == linenoiseEditMore) continue; /* 还没输完 */
-
-                /* 一行输入完成 */
-                linenoiseEditStop(&l);
-                editing = 0;
-                linenoiseHistoryAdd(res);
-
-                /* 本地跟踪昵称: /nick 后提示符跟着变 */
-                if (!strncmp(res, "/nick ", 6) && res[6])
-                    snprintf(prompt, sizeof(prompt), "%s> ", res + 6);
-
-                write(s, res, strlen(res));
-                write(s, "\n", 1);
-                free(res);
             }
         }
     }
+
     close(s);
     return 0;
 }
