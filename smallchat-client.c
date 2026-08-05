@@ -144,15 +144,21 @@ void inputBufferShow(struct InputBuffer *ib);
  * the user is typing, so that reading the input buffer 'buf' for 'len'
  * bytes will contain it. */
 int inputBufferFeedChar(struct InputBuffer *ib, int c) {
-    /* 吞掉方向键/Home 等 ESC 序列 (\e[A 等 3 字节), 防止垃圾进入输入行。
-     * 只吞 \e + 下一字节; 若下一字节是 '[' 再吞一个 (完整 CSI 序列)。 */
-    static int escseq = 0;
+    /* 吞掉方向键/Home/Delete 等控制序列, 防止垃圾进入输入行。
+     * 两种开头: ESC (0x1b, 7位) 和 0x9b (8位 CSI)。
+     * 若下一字节是 '[' 或 'O' 则是 CSI/SS3 序列, 一直吞到终结字节 (>=0x40),
+     * 这样 \e[A (3字节) 和 \e[3~ (Delete, 4字节) 都能正确处理。 */
+    static int escseq = 0; /* 0=空闲, 1=刚收到开头, 2=CSI 序列中 */
     if (escseq) {
-        if (escseq == 2) { escseq = 0; return IB_OK; }
-        escseq = (c == '[') ? 2 : 0;
+        if (escseq == 1) {
+            escseq = (c == '[' || c == 'O') ? 2 : 0;
+            return IB_OK;
+        }
+        if (c >= 0x40) escseq = 0; /* CSI 终结字节 (~ @ A-Z a-z) */
         return IB_OK;
     }
-    if (c == '\e') { escseq = 1; return IB_OK; }
+    /* 注意: 字节流经 char->int 是符号扩展, 0x9b 会变成负数, 必须转 unsigned 比较 */
+    if (c == '\e' || (unsigned char)c == 0x9b) { escseq = 1; return IB_OK; }
 
     switch(c) {
     case '\n':
