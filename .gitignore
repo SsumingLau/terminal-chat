@@ -4,3 +4,5 @@ smallchat-server
 smallchat-client
 .claude/
 logs/
+.agents/
+skills-lock.json
