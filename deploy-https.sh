@@ -16,8 +16,7 @@ sudo tee /etc/apache2/sites-available/chat-https.conf >/dev/null <<EOF
     SSLEngine on
     SSLCertificateFile /etc/apache2/ssl/chat.crt
     SSLCertificateKeyFile /etc/apache2/ssl/chat.key
-    # 根路径跳回 http 站(另一个 index 界面); 聊天挂在 /chat
-    RedirectMatch ^/$ http://$IP/
+    # 聊天挂在 /chat; 其余路径全部反代到 :80 的现有站点(全站 https)
     RedirectMatch ^/chat$ /chat/
     # disablereuse 防后端连接复用串流; timeout 86400s 防 SSE 长连接被掐断
     ProxyPass /chat/ http://127.0.0.1:7712/ disablereuse=On timeout=86400
@@ -25,6 +24,8 @@ sudo tee /etc/apache2/sites-available/chat-https.conf >/dev/null <<EOF
     <Location /chat/>
         SetEnv proxy-sendchunked 1
     </Location>
+    ProxyPass / http://127.0.0.1:80/
+    ProxyPassReverse / http://127.0.0.1:80/
 </VirtualHost>
 EOF
 sudo a2enmod ssl proxy proxy_http >/dev/null
@@ -32,5 +33,5 @@ sudo a2ensite chat-https >/dev/null 2>&1 || true   # 已启用时 a2ensite 返�
 sudo apachectl configtest
 sudo service apache2 reload
 echo "完成: 浏览器打开 https://$IP/chat 聊天(首次点'高级 → 继续访问')"
-echo "      https://$IP 根路径会跳转到你的 http 站"
+echo "      :80 上的所有页面(含根路径)现在都可走 https://$IP/<路径>"
 echo "注意: 自签名证书下浏览器通知不可用; 想要通知 + 无警告需域名真证书"
