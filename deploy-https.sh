@@ -7,9 +7,12 @@ IP="$1"
 [ -n "$IP" ] || { echo "用法: $0 <服务器IP>"; exit 1; }
 sudo apt-get install -y apache2 openssl >/dev/null
 sudo mkdir -p /etc/apache2/ssl
-sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-  -keyout /etc/apache2/ssl/chat.key -out /etc/apache2/ssl/chat.crt \
-  -subj "/CN=$IP" -addext "subjectAltName=IP:$IP"   # SAN 必须, 否则 Chrome 拒收
+# 证书已存在就不重生成: 重跑脚本不能把浏览器已接受的证书作废
+if [ ! -f /etc/apache2/ssl/chat.key ] || [ ! -f /etc/apache2/ssl/chat.crt ]; then
+    sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -keyout /etc/apache2/ssl/chat.key -out /etc/apache2/ssl/chat.crt \
+      -subj "/CN=$IP" -addext "subjectAltName=IP:$IP"   # SAN 必须, 否则 Chrome 拒收
+fi
 sudo tee /etc/apache2/sites-available/chat-https.conf >/dev/null <<EOF
 <VirtualHost *:443>
     ServerName $IP
