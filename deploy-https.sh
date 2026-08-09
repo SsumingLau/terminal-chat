@@ -1,0 +1,36 @@
+#!/bin/sh
+# 服务器上运行(需 sudo): 自签名证书 + Apache 反代 443 -> 7712, 网页端 HTTPS。
+# 用法: ./deploy-https.sh <服务器IP>
+# 无域名方案: 自签名加密有效, 只是浏览器首次访问要点"高级 → 继续"。
+set -e
+IP="$1"
+[ -n "$IP" ] || { echo "用法: $0 <服务器IP>"; exit 1; }
+sudo apt-get install -y apache2 openssl >/dev/null
+sudo mkdir -p /etc/apache2/ssl
+sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+  -keyout /etc/apache2/ssl/chat.key -out /etc/apache2/ssl/chat.crt \
+  -subj "/CN=$IP" -addext "subjectAltName=IP:$IP"   # SAN 必须, 否则 Chrome 拒收
+sudo tee /etc/apache2/sites-available/chat-https.conf >/dev/null <<EOF
+<VirtualHost *:443>
+    ServerName $IP
+    SSLEngine on
+    SSLCertificateFile /etc/apache2/ssl/chat.crt
+    SSLCertificateKeyFile /etc/apache2/ssl/chat.key
+    # 根路径跳回 http 站(另一个 index 界面); 聊天挂在 /chat
+    RedirectMatch ^/$ http://$IP/
+    RedirectMatch ^/chat$ /chat/
+    # disablereuse 防后端连接复用串流; timeout 86400s 防 SSE 长连接被掐断
+    ProxyPass /chat/ http://127.0.0.1:7712/ disablereuse=On timeout=86400
+    ProxyPassReverse /chat/ http://127.0.0.1:7712/
+    <Location /chat/>
+        SetEnv proxy-sendchunked 1
+    </Location>
+</VirtualHost>
+EOF
+sudo a2enmod ssl proxy proxy_http >/dev/null
+sudo a2ensite chat-https >/dev/null 2>&1 || true   # 已启用时 a2ensite 返回 1, 忽略
+sudo apachectl configtest
+sudo service apache2 reload
+echo "完成: 浏览器打开 https://$IP/chat 聊天(首次点'高级 → 继续访问')"
+echo "      https://$IP 根路径会跳转到你的 http 站"
+echo "注意: 自签名证书下浏览器通知不可用; 想要通知 + 无警告需域名真证书"

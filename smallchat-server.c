@@ -527,7 +527,7 @@ void replayRoomHistory(int fd, const char *room) {
 /* ============================ Web page ================================= */
 
 const char INDEX_HTML[] =
-"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+"<!DOCTYPE html><html><head><meta charset='utf-8'><link rel='icon' href='data:,'>"
 "<meta name='viewport' content='width=device-width,initial-scale=1,interactive-widget=resizes-content'>"
 "<title>Terminal Chat</title>"
 "<style>"
@@ -535,6 +535,7 @@ const char INDEX_HTML[] =
 "#login{max-width:320px;width:100%;box-sizing:border-box;margin:auto;padding:24px;background:#1a1a1a;border:1px solid #333;border-radius:8px}"
 "#login h1{font-size:16px;margin:0 0 16px;color:#7fb3e8}"
 "#login input{display:block;width:100%;box-sizing:border-box;margin:8px 0;padding:8px;background:#111;border:1px solid #333;color:#ddd;border-radius:4px;font-size:16px}"
+"#pass{-webkit-text-security:disc}"
 "#login button{width:100%;padding:9px;background:#2b5f8f;border:0;color:#fff;border-radius:4px;font-size:14px;cursor:pointer}"
 "#login .err{color:#e88080;font-size:12px;margin-top:8px;min-height:14px}"
 "#chat{display:none;flex:1;flex-direction:column;max-width:720px;margin:0 auto;padding:12px;box-sizing:border-box;min-height:0;width:100%}"
@@ -548,7 +549,7 @@ const char INDEX_HTML[] =
 "<form id='login' onsubmit='enter();return false' autocomplete='off'><h1>Terminal Chat</h1>"
 "<input id='nick' placeholder='昵称' maxlength='24'>"
 "<input id='room' placeholder='房间名' maxlength='64'>"
-"<input id='pass' placeholder='密码 (可选)' type='password' autocomplete='off'>"
+"<input id='pass' placeholder='密码 (可选)' type='text' autocomplete='off'>"
 "<button>进入</button>"
 "<div class='err' id='err'></div></form>"
 "<div id='chat'><div id='msgs'></div>"
@@ -588,7 +589,7 @@ const char INDEX_HTML[] =
 "if(!n||!r){document.getElementById('err').textContent='昵称和房间名必填';return;}"
 "var body='nick='+encodeURIComponent(n)+'&room='+encodeURIComponent(r)"
 "+(p?'&password='+encodeURIComponent(p):'');"
-"fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})"
+"fetch('login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})"
 ".then(function(x){if(!x.ok)return x.text().then(function(t){throw t});return x.text()})"
 ".then(function(t){var i=t.indexOf('\\n');token=t.slice(0,i);"
 "document.getElementById('login').style.display='none';"
@@ -604,7 +605,7 @@ const char INDEX_HTML[] =
 "document.getElementById('msgs').appendChild(hd);}}"
 "var m=document.getElementById('msgs');m.scrollTop=m.scrollHeight;"
 "if('Notification' in window&&Notification.permission==='default')Notification.requestPermission();"
-"var es=new EventSource('/events?token='+encodeURIComponent(token));"
+"var es=new EventSource('events?token='+encodeURIComponent(token));"
 "es.onmessage=function(e){add(e.data);"
 "if('Notification' in window&&document.hidden&&Notification.permission==='granted')new Notification('新消息',{body:e.data});};"
 "es.onerror=function(){ /* EventSource 自动重连 */ };})"
@@ -612,7 +613,7 @@ const char INDEX_HTML[] =
 "var inp=document.getElementById('inp');"
 "inp.addEventListener('keydown',function(e){if(e.key==='Enter'){"
 "var m=inp.value;if(!m.trim())return;inp.value='';"
-"fetch('/send',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+"fetch('send',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
 "body:'token='+encodeURIComponent(token)+'&msg='+encodeURIComponent(m)})"
 ".catch(function(){add('[系统] 发送失败');});}});"
 "</script></body></html>";
