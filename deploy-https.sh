@@ -21,7 +21,9 @@ sudo tee /etc/apache2/sites-available/chat-https.conf >/dev/null <<EOF
     SSLCertificateFile /etc/apache2/ssl/chat.crt
     SSLCertificateKeyFile /etc/apache2/ssl/chat.key
     # 聊天挂在 /$P; 其余路径全部反代到 :80 的现有站点(全站 https)
-    RedirectMatch ^/$P$ /$P/
+    # 无尾斜杠补斜杠必须用 RewriteRule: RedirectMatch 会被后面的 ProxyPass / 抢先
+    RewriteEngine On
+    RewriteRule ^/$P$ /$P/ [R=302,L]
     # disablereuse 防后端连接复用串流; timeout 86400s 防 SSE 长连接被掐断
     ProxyPass /$P/ http://127.0.0.1:7712/ disablereuse=On timeout=86400
     ProxyPassReverse /$P/ http://127.0.0.1:7712/
@@ -32,7 +34,7 @@ sudo tee /etc/apache2/sites-available/chat-https.conf >/dev/null <<EOF
     ProxyPassReverse / http://127.0.0.1:80/
 </VirtualHost>
 EOF
-sudo a2enmod ssl proxy proxy_http >/dev/null
+sudo a2enmod ssl proxy proxy_http rewrite >/dev/null
 sudo a2ensite chat-https >/dev/null 2>&1 || true   # 已启用时 a2ensite 返回 1, 忽略
 sudo apachectl configtest
 sudo service apache2 reload
