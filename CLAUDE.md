@@ -13,7 +13,7 @@
 - 服务器 Ubuntu 20.04 x86_64, 源码在 `~/terminal-chat/`。安全组已收口为 22 + 443(7711/7712 不对公网)。
 - **必须传源码、在服务器上编译**(本地二进制是 Mach-O, Linux 跑不了; 反过来亦然)。
 - 重启服务器进程:`ssh <用户>@<服务器> 'cd ~/terminal-chat && (setsid ./smallchat-server > /tmp/tc.log 2>&1 </dev/null &)'`。杀旧进程用 `ss -tlnp | grep 7711` 找 pid 再 kill(pkill -x 匹配不到, 进程名被内核截断成 smallchat-serve)。
-- 注意: 无 systemd, 服务器重启后需手动拉起。网页已加密(`https://<IP>/chat`, 自签名 + Apache 反代, 见下节)。
+- 注意: 无 systemd, 服务器重启后需手动拉起。网页已加密(`https://<IP>/enchantedgalleons`, 自签名 + Apache 反代, 见下节)。
 - 更新服务器二进制: **先 kill 再 make/scp**(覆盖运行中的二进制会 ETXTBSY)。
 
 ## 已知约定(含 2026-08 加密功能踩坑)
@@ -38,11 +38,11 @@
 原计划(应用层 ChaCha20 自实现 ~300 行)放弃: 自写密码学是 3am bug 农场, 且要改双端协议。改用原生加密:
 
 - **终端 = SSH 隧道**(`tunnel.sh`, 免密 key 认证的前提)。
-- **网页 = HTTPS**: 无域名, 自签名证书 + **Apache** 反代 443→7712, 挂 `/chat` 路径(`deploy-https.sh`, 服务器上跑一次, 可重复跑)。用户服务器已装 Apache(无 nginx)。
-  - 访问地址 `https://<IP>/chat`; 根路径跳回 http 站。
+- **网页 = HTTPS**: 无域名, 自签名证书 + **Apache** 反代 443→7712, 挂自定义路径(`deploy-https.sh <IP> [路径, 默认 chat]`, 服务器上跑一次, 可重复跑; 证书已存在就不重生成)。用户服务器已装 Apache(无 nginx)。
+  - 访问地址 `https://<IP>/enchantedgalleons`; 全站 https(`/` 及 :80 各路径都反代)。
   - 浏览器首次访问点"高级 → 继续"; 加密有效但证书不受信任。
   - 浏览器通知(Notification API)在自签名下不可用(http/自签名都不是 secure context)。升级路径: duckdns 免费域名 + Let's Encrypt(或阿里云买域名), 换掉证书即可, 顺带消警告。
-- 网页 JS 用相对路径(`fetch('login')` 等), 反代挂子路径(/chat)和挂根都兼容; **改回绝对路径会破坏 /chat 部署**。
+- 网页 JS 用相对路径(`fetch('login')` 等), 反代挂子路径(如 /chat、/enchantedgalleons)和挂根都兼容; **改回绝对路径会破坏子路径部署**。
 - 安全组已收口为 22 + 443, 7711/7712 不再公网直连。
 - 不做 E2E(服务器保留明文转发, 消息互通简单)。
 

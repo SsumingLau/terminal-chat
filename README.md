@@ -63,7 +63,7 @@ make
 
 ### 网页端
 
-1. 浏览器打开 `https://<服务器IP>/chat`(注意结尾斜杠; 服务器上先跑过 `deploy-https.sh` 才有 HTTPS)
+1. 浏览器打开 `https://<服务器IP>/chat`(注意结尾斜杠; 服务器上先跑过 `deploy-https.sh` 才有 HTTPS。路径可改: `./deploy-https.sh <IP> <路径>`, 如 `./deploy-https.sh <IP> enchantedgalleons`)
 2. 输入昵称、房间名、密码(可选) → 进入
 3. 网页用户和终端用户在同一个房间里互聊
 
@@ -76,7 +76,7 @@ make
 
 - 服务器上编译(源码跨平台, 二进制不通用): `make && ./smallchat-server`
 - 安全组: 放行 22 + 443 即可(7711/7712 走 SSH 隧道和 Apache 反代, 不对外)
-- 网页加密: `./deploy-https.sh <服务器IP>`(见"加密传输"节)
+- 网页加密: `./deploy-https.sh <服务器IP> [聊天路径, 默认 chat]`(见"加密传输"节)
 - 后台运行: `nohup ./smallchat-server > /dev/null 2>&1 &`
 - 端口修改: `smallchat-server.c` 里的 `SERVER_PORT` / `WEB_PORT`, 重编译
 
@@ -88,15 +88,16 @@ make
   `./tunnel.sh <ssh 目标>`(如 `./tunnel.sh lsm`), 即
   `ssh -fN -L 7711:127.0.0.1:7711 <ssh目标>` 后 `./smallchat-client 127.0.0.1 7711`
 - **网页** — 无域名也能加密: 服务器上跑一次 `./deploy-https.sh <服务器IP>`,
-  生成自签名证书 + Apache 反代 443→7712, 浏览器打开 `https://<IP>/chat`。
+  生成自签名证书 + Apache 反代 443→7712, 浏览器打开 `https://<IP>/chat`
+  (路径默认 `/chat`, 第二个参数可改名, 如 `./deploy-https.sh <IP> enchantedgalleons`)。
   首次访问点"高级 → 继续"一次; 加密有效, 只是证书不受信任
   (代价: 自签名下浏览器通知不可用, 要通知需域名真证书)
 
 配好后把**安全组收口为只放行 22 + 443**, 关掉 7711/7712 公网直连,
 密码和消息就不再裸奔。注意: 关 7711 后 telnet 用户不可用, 用浏览器即可。
-网页反代挂 `/chat` 路径, 其余路径反代到 :80 的现有站点 —— 服务器上
-http 站的所有页面(含根路径)都能换成 `https://<IP>/<原路径>` 访问;
-`/chat` 不带尾斜杠会自动补上(已配重定向)。
+网页聊天挂在自定义路径(默认 `/chat`, `deploy-https.sh` 第二参数可改名),
+其余路径反代到 :80 的现有站点 —— 服务器上 http 站的所有页面(含根路径)
+都能换成 `https://<IP>/<原路径>` 访问; 聊天路径不带尾斜杠会自动补上(已配重定向)。
 
 ## 限制与说明
 
